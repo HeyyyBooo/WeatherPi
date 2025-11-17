@@ -2,76 +2,83 @@ from flask import Flask, request, render_template_string, redirect, url_for, ses
 import threading, queue, json, time, os, hashlib, requests
 import paho.mqtt.client as mqtt
 
-# ---------- Config ----------
-BROKER_HOST = os.getenv("BROKER_HOST", "10.147.255.200")
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
+BROKER_HOST = os.getenv("BROKER_HOST", "172.30.148.200")
 BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
-MQTT_TOPIC  = os.getenv("MQTT_TOPIC", "sensors/#")
+MQTT_TOPIC  = "sensors/+/+"        # subscribe to all devices & sensors
 SQL_API     = os.getenv("SQL_API", "https://narzee-sqlt.onrender.com/query")
 SECRET_KEY  = os.getenv("SECRET_KEY", "supersecret")
 MYKEY="VUSAN"
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
-app.debug = False  # set True while debugging
 
-# ---------- MQTT / App state ----------
-clients, clients_lock = [], threading.Lock()
-history, history_lock = [], threading.Lock()
-latest, latest_lock   = {"temp": None, "hum": None, "pres": None, "ts": None}, threading.Lock()
+# -------------------------------------------------------------------
+# GLOBALS
+# -------------------------------------------------------------------
+clients = []
+clients_lock = threading.Lock()
+
+history = []        # unified list
+history_lock = threading.Lock()
+
 MAX_HISTORY = 1000
 
-# ---------- Utilities ----------
-def hash_password(password: str) -> str:
+latest = {
+    "temp": None,
+    "hum": None,
+    "pres": None,
+    "ts": None
+}
+latest_lock = threading.Lock()
+
+# -------------------------------------------------------------------
+# UTILS
+# -------------------------------------------------------------------
+def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-def run_query(query: str):
-    # lightweight log of queries (avoid logging passwords in production)
-    print(f"[SQL] {query}")
+def run_query(q):
+    print("[SQL]", q)
 
-def execute_sql(query: str):
-    """
-    Execute a remote SQL query via the SQL_API.
-    If the response indicates the users table is missing, create it and retry once.
-    Returns the parsed JSON response (dict) or {'error': ...} on failure.
-    """
-    run_query(query)
+def execute_sql(q):
+    run_query(q)
     try:
-        r = requests.get(SQL_API, params={"q": query}, timeout=10)
+        r = requests.get(SQL_API, params={"q": q}, timeout=10)
         data = r.json()
-        print("[SQL] response:", data)
+    except:
+        return {"error": "SQL request failed"}
 
-        # Detect "no such table: users" (or similar) in the response and auto-create table
-        msg = ""
-        if isinstance(data, dict):
-            msg = data.get("message") or data.get("error") or ""
-        if isinstance(msg, str) and "no such table" in msg.lower() and "users" in msg.lower():
-            print("[SQL] 'users' table missing — creating it now...")
-            create_q = (
-                "CREATE TABLE IF NOT EXISTS users ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "username TEXT UNIQUE NOT NULL, "
-                "password TEXT NOT NULL"
-                ");"
-            )
-            # attempt to create table (fire-and-forget); ignore its response
-            try:
-                requests.get(SQL_API, params={"q": create_q}, timeout=10)
-            except Exception as e:
-                print("[SQL] create table request failed:", e)
-                return {"error": str(e)}
-            # retry original query once
-            try:
-                r2 = requests.get(SQL_API, params={"q": query}, timeout=10)
-                data = r2.json()
-                print("[SQL] retry response:", data)
-            except Exception as e:
-                print("[SQL] retry failed:", e)
-                return {"error": str(e)}
+    # Auto-create both tables if missing
+    msg = (data.get("message") or data.get("error") or "").lower()
 
-        return data
+    if "no such table" in msg:
+        if "users" in msg:
+            requests.get(SQL_API, params={"q": """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL
+                );
+            """})
 
-    except Exception as e:
-        print("SQL API error:", e)
-        return {"error": str(e)}
+        if "user_data" in msg:
+            requests.get(SQL_API, params={"q": """
+                CREATE TABLE IF NOT EXISTS user_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    temp_sub INTEGER DEFAULT 0,
+                    hum_sub INTEGER DEFAULT 0,
+                    pres_sub INTEGER DEFAULT 0
+                );
+            """})
+
+        # Retry original query
+        r = requests.get(SQL_API, params={"q": q}, timeout=10)
+        return r.json()
+
+    return data
 def decrypt(cipher_text, key):
     """Decrypt a value encrypted with the encrypt() function."""
     key_str = str(key)
@@ -81,11 +88,11 @@ def decrypt(cipher_text, key):
         decrypted_val = int(val) ^ ord(key_str[i % len(key_str)])
         decrypted_chars.append(chr(decrypted_val))
     return float("".join(decrypted_chars)) if "." in decrypted_chars else int("".join(decrypted_chars))
-
-# ---------- Authentication routes (signup/login/logout) ----------
+# -------------------------------------------------------------------
+# AUTH PAGES
+# -------------------------------------------------------------------
 LOGIN_HTML = """
-<!doctype html>
-<html><head>
+<!doctype html><html><head>
 <title>Login</title>
 <style>
 body { font-family: sans-serif; background:#eef2f5; display:flex; justify-content:center; align-items:center; height:100vh; }
@@ -93,23 +100,20 @@ form { background:white; padding:2rem; border-radius:8px; box-shadow:0 2px 6px r
 input { width:100%; padding:10px; margin-bottom:10px; border:1px solid #ccc; border-radius:4px; }
 button { width:100%; padding:10px; background:#0078d7; color:white; border:none; border-radius:4px; }
 .error { color:red; margin-bottom:10px; text-align:center; }
-a { text-decoration:none; color:#0078d7; }
-</style>
-</head><body>
+</style></head><body>
 <form method="post">
   <h3>User Login</h3>
   {% if error %}<div class="error">{{error}}</div>{% endif %}
-  <input type="text" name="username" placeholder="Username" required autofocus>
-  <input type="password" name="password" placeholder="Password" required>
-  <button type="submit">Login</button>
-  <p style="text-align:center;margin-top:10px;">New user? <a href="/signup">Sign up</a></p>
+  <input name="username" placeholder="Username" required>
+  <input name="password" type="password" placeholder="Password" required>
+  <button>Login</button>
+  <p>New user? <a href="/signup">Sign up</a></p>
 </form>
 </body></html>
 """
 
 SIGNUP_HTML = """
-<!doctype html>
-<html><head>
+<!doctype html><html><head>
 <title>Sign Up</title>
 <style>
 body { font-family: sans-serif; background:#eef2f5; display:flex; justify-content:center; align-items:center; height:100vh; }
@@ -117,317 +121,361 @@ form { background:white; padding:2rem; border-radius:8px; box-shadow:0 2px 6px r
 input { width:100%; padding:10px; margin-bottom:10px; border:1px solid #ccc; border-radius:4px; }
 button { width:100%; padding:10px; background:#0078d7; color:white; border:none; border-radius:4px; }
 .error { color:red; margin-bottom:10px; text-align:center; }
-a { text-decoration:none; color:#0078d7; }
-</style>
-</head><body>
+</style></head><body>
 <form method="post">
   <h3>Create Account</h3>
+
   {% if error %}<div class="error">{{error}}</div>{% endif %}
-  <input type="text" name="username" placeholder="Choose Username" required autofocus>
-  <input type="password" name="password" placeholder="Choose Password" required>
-  <button type="submit">Sign Up</button>
-  <p style="text-align:center;margin-top:10px;">Already have an account? <a href="/login">Login</a></p>
+
+  <input name="username" placeholder="Choose Username" required autofocus>
+  <input name="password" type="password" placeholder="Choose Password" required>
+
+  <label><input type="checkbox" name="temp_sub"> Temperature</label><br>
+  <label><input type="checkbox" name="hum_sub"> Humidity</label><br>
+  <label>
+  <input type="checkbox" name="pres_sub" value="0" disabled>
+  Pressure (Unavailable)
+</label><br>
+
+
+  <button>Sign Up</button>
 </form>
 </body></html>
 """
 
-@app.route("/signup", methods=["GET", "POST"])
+@app.route("/signup", methods=["GET","POST"])
 def signup():
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "").strip()
-        if not username or not password:
-            return render_template_string(SIGNUP_HTML, error="Username and password required")
-        hashed = hash_password(password)
+        u = request.form["username"].strip()
+        p = request.form["password"].strip()
+        hp = hash_password(p)
 
-        # check if user already exists
-        q_check = f"SELECT * FROM users WHERE username='{username}';"
-        res_check = execute_sql(q_check)
-        if res_check.get("data"):
+        # Check user
+        if execute_sql(f"SELECT * FROM users WHERE username='{u}'").get("data"):
             return render_template_string(SIGNUP_HTML, error="User already exists")
 
-        # create user
-        q_insert = f"INSERT INTO users (username, password) VALUES ('{username}', '{hashed}');"
-        insert_res = execute_sql(q_insert)
-        if insert_res.get("error"):
-            return render_template_string(SIGNUP_HTML, error="Could not create user")
-        return redirect(url_for("login"))
+        execute_sql(f"INSERT INTO users (username, password) VALUES ('{u}', '{hp}')")
 
-    return render_template_string(SIGNUP_HTML, error=None)
+        t = 1 if request.form.get("temp_sub") else 0
+        h = 1 if request.form.get("hum_sub") else 0
+        pr = 1 if request.form.get("pres_sub") else 0
 
-@app.route("/login", methods=["GET", "POST"])
+        execute_sql(f"""
+            INSERT INTO user_data (username, temp_sub, hum_sub, pres_sub)
+            VALUES ('{u}', {t}, {h}, {pr});
+        """)
+
+        return redirect("/login")
+
+    return render_template_string(SIGNUP_HTML)
+
+@app.route("/login", methods=["GET","POST"])
 def login():
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "").strip()
-        if not username or not password:
-            return render_template_string(LOGIN_HTML, error="Username and password required")
-        hashed = hash_password(password)
-        q = f"SELECT * FROM users WHERE username='{username}' AND password='{hashed}';"
-        result = execute_sql(q)
-        print("[LOGIN] result:", result)
-        ok = bool(result.get("data"))
-        if ok:
-            session["user"] = username
-            return redirect(url_for("index"))
-        else:
-            return render_template_string(LOGIN_HTML, error="Invalid username or password")
-    return render_template_string(LOGIN_HTML, error=None)
+        u = request.form["username"].strip()
+        p = request.form["password"].strip()
+        hp = hash_password(p)
+
+        res = execute_sql(f"SELECT * FROM users WHERE username='{u}' AND password='{hp}'")
+        if not res.get("data"):
+            return render_template_string(LOGIN_HTML, error="Invalid username/password")
+
+        session["user"] = u
+
+        pref = execute_sql(f"SELECT * FROM user_data WHERE username='{u}'").get("data",[{}])[0]
+        print(pref)
+        session["temp_sub"] = pref[2]
+        session["hum_sub"]  = pref[3]
+        session["pres_sub"] = pref[4]
+
+        return redirect("/")
+
+    return render_template_string(LOGIN_HTML)
 
 @app.route("/logout")
 def logout():
     session.clear()
-    return redirect(url_for("login"))
+    return redirect("/login")
 
-# ---------- MQTT callbacks & handling ----------
-def on_connect(client, userdata, flags, rc, properties=None):
-    print("MQTT connected, rc:", rc)
-    client.subscribe(MQTT_TOPIC, qos=1)
-
+# -------------------------------------------------------------------
+# MQTT CALLBACKS
+# -------------------------------------------------------------------
+def on_connect(client, userdata, flags, rc, props=None):
+    print("MQTT connected")
+    client.subscribe(MQTT_TOPIC)
 def on_message(client, userdata, msg):
-    payload_raw = msg.payload.decode("utf-8", errors="ignore").strip()
+    topic_parts = msg.topic.split("/")
+    # Expect: sensors/<device>/<metric>
+    if len(topic_parts) != 3:
+        return
+
+    _, device_id, metric = topic_parts
+
+    # Parse JSON payload
     try:
-        payload = json.loads(payload_raw)
-    except Exception:
-        payload = {"raw": payload_raw}
+        data = json.loads(msg.payload.decode("utf-8"))
+    except:
+        print("Invalid JSON:", msg.payload)
+        return
 
-    # Extract sensors: support nested payload["value"] or flat keys
-    temp = None
-    hum = None
-    pres = None
+    ts = data.get("ts", int(time.time() * 1000))
+    raw_value = data.get("value")
 
-    if isinstance(payload.get("value"), dict):
+    # Default values
+    temp = hum = pres = None
+
+    # ----------------------------
+    # ✔ Decrypt ONLY encrypted values
+    # ----------------------------
+    if metric == "temperature":
+        temp = decrypt(raw_value, MYKEY) if raw_value else None
+
+    elif metric == "humidity":
+        hum = decrypt(raw_value, MYKEY) if raw_value else None
+
+    elif metric == "pressure":
+        # Pressure is NOT encrypted in your publisher
         try:
-            temp = decrypt(payload["value"].get("temperature"),MYKEY)
-            hum  = decrypt(payload["value"].get("humidity"),MYKEY)
-            pres = payload["value"].get("pressure")
-        except Exception:
-            pass
+            pres = float(raw_value)
+        except:
+            pres = None
 
-    # fallback to flat keys (if present)
-    temp = temp if temp is not None else payload.get("temperature") or payload.get("temp")
-    hum  = hum  if hum  is not None else payload.get("humidity") or payload.get("hum")
-    pres = pres if pres is not None else payload.get("pressure") or payload.get("pres")
+    # Create parsed record
+    record = {
+        "ts": ts,
+        "temp": temp,
+        "hum": hum,
+        "pres": pres,
+        "device": device_id,
+        "raw": data
+    }
 
-    # convert to floats where possible
-    def to_float(x):
-        try: return float(x)
-        except: return None
-    temp, hum, pres = map(to_float, (temp, hum, pres))
+    print("[MQTT Parsed]", record)
 
-    # timestamp sanity check: if ts missing or obviously invalid (too far in future), replace with now
-    ts_raw = payload.get("ts")
-    try:
-        ts = int(ts_raw) if ts_raw is not None else None
-    except Exception:
-        ts = None
-    now_ms = int(time.time() * 1000)
-    # if ts is None or ts is absurd (e.g., > now + 1 day), set to now
-    if ts is None or ts > now_ms + 86_400_000:
-        ts = now_ms
-
-    record = {"ts": ts, "temp": temp, "hum": hum, "pres": pres, "raw": payload, "topic": msg.topic}
-
+    # Store in history
     with history_lock:
         history.append(record)
         if len(history) > MAX_HISTORY:
             history.pop(0)
 
+    # Update latest values
     with latest_lock:
         if temp is not None: latest["temp"] = temp
         if hum is not None: latest["hum"] = hum
         if pres is not None: latest["pres"] = pres
         latest["ts"] = ts
 
-    # broadcast to SSE clients (non-blocking best-effort)
+    # Broadcast to connected SSE clients
     with clients_lock:
         for q in list(clients):
             try:
                 q.put_nowait(record)
             except queue.Full:
-                # client's queue full; drop this message for that client
                 pass
 
-def start_mqtt_loop():
-    try:
-        client = mqtt.Client(protocol=mqtt.MQTTv5)
-        client.on_connect = on_connect
-        client.on_message = on_message
-        client.connect(BROKER_HOST, BROKER_PORT, keepalive=60)
-        client.loop_forever()
-    except Exception as e:
-        print("MQTT thread error:", e)
 
-mqtt_thread = threading.Thread(target=start_mqtt_loop, daemon=True)
-mqtt_thread.start()
+def mqtt_thread():
+    c = mqtt.Client(protocol=mqtt.MQTTv5)
+    c.on_connect = on_connect
+    c.on_message = on_message
+    c.connect(BROKER_HOST, BROKER_PORT, keepalive=60)
+    c.loop_forever()
 
-# ---------- SSE endpoint ----------
-def event_stream(q: queue.Queue):
-    try:
-        while True:
-            msg = q.get()
-            yield f"data: {json.dumps(msg)}\n\n"
-    except GeneratorExit:
-        return
+threading.Thread(target=mqtt_thread, daemon=True).start()
+
+# -------------------------------------------------------------------
+# SSE
+# -------------------------------------------------------------------
+def event_stream(q):
+    while True:
+        msg = q.get()
+        yield f"data: {json.dumps(msg)}\n\n"
 
 @app.route("/stream")
 def stream():
     if "user" not in session:
-        return redirect(url_for("login"))
-    q = queue.Queue(maxsize=200)
+        return redirect("/login")
+
+    q = queue.Queue()
     with clients_lock:
         clients.append(q)
+
     return Response(event_stream(q), mimetype="text/event-stream")
 
-# ---------- API endpoints for frontend ----------
+# -------------------------------------------------------------------
+# API
+# -------------------------------------------------------------------
 @app.route("/api/history")
 def api_history():
     if "user" not in session:
-        return jsonify({"error": "unauthorized"}), 403
+        return jsonify({"error":"unauthorized"}),403
+
+    temps=[]; hums=[]; press=[]
     with history_lock:
-        temps = [[r["ts"], r["temp"]] for r in history if r["temp"] is not None]
-        hums  = [[r["ts"], r["hum"]] for r in history if r["hum"] is not None]
-        press = [[r["ts"], r["pres"]] for r in history if r["pres"] is not None]
-        return jsonify({"temp": temps, "hum": hums, "pres": press})
+        for r in history:
+            if r["temp"] is not None: temps.append([r["ts"], r["temp"]])
+            if r["hum"]  is not None: hums.append([r["ts"], r["hum"]])
+            if r["pres"] is not None: press.append([r["ts"], r["pres"]])
+
+    return jsonify({"temp":temps, "hum":hums, "pres":press})
 
 @app.route("/api/latest")
 def api_latest():
     if "user" not in session:
-        return jsonify({"error": "unauthorized"}), 403
+        return jsonify({"error":"unauthorized"}),403
     with latest_lock:
         return jsonify(latest)
 
-# ---------- Frontend HTML (includes luxon + chartjs-adapter-luxon) ----------
+# -------------------------------------------------------------------
+# DASHBOARD UI
+# -------------------------------------------------------------------
 INDEX_HTML = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
+<!doctype html><html><head>
 <title>WeatherPi Dashboard</title>
-<!-- Chart.js + Luxon adapter for time axis -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-<script src="https://cdn.jsdelivr.net/npm/luxon@3/build/global/luxon.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/luxon/build/global/luxon.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon"></script>
 
 <style>
-body{font-family:Arial;margin:12px;background:#f2f4f7}
-.card{background:white;padding:12px;border-radius:8px;margin-bottom:10px;box-shadow:0 1px 4px rgba(0,0,0,0.08)}
-.logout{float:right}
-.meta{font-size:0.9rem;color:#555}
-#raw{max-height:40vh;overflow:auto;font-family:monospace;font-size:0.9rem}
+body{font-family:sans-serif;background:#eef2f5;margin:10px}
+.card{background:white;padding:15px;border-radius:8px;margin-bottom:12px;
+      box-shadow:0 2px 6px rgba(0,0,0,0.1)}
 .grid{display:grid;grid-template-columns:1fr;gap:12px}
-@media(min-width:900px){ .grid{grid-template-columns:1fr 1fr} }
-small.note{color:#666}
+@media(min-width:900px){.grid{grid-template-columns:1fr 1fr}}
+.current{font-size:1.3rem;font-weight:bold;margin-top:6px}
+#raw{font-family:monospace;font-size:0.9rem;max-height:40vh;overflow:auto}
 </style>
-</head>
-<body>
+
+</head><body>
 <div class="card">
-  <div style="display:flex;align-items:center;justify-content:space-between">
-    <div>
-      <h2 style="margin:.2rem 0">WeatherPi Dashboard</h2>
-      <div class="meta">User: <b>{{user}}</b> &nbsp; Broker: <b>{{broker}}</b> &nbsp; Topic: <b>{{topic}}</b></div>
-    </div>
-    <div><a href="/logout">Logout</a></div>
-  </div>
+  <h2>WeatherPi Dashboard</h2>
+  <p>User: <b>{{user}}</b></p>
+  <p>Broker: {{broker}} | Topic: {{topic}}</p>
+  <a href="/logout">Logout</a>
 </div>
 
-<div class="card grid">
-  <div>
-    <h4>Temperature (°C)</h4>
-    <canvas id="chart-temp" height="160"></canvas>
+<div class="grid">
+
+  <div class="card">
+    <h4>{{ "Temperature (°C)" if temp_sub else "Temperature [NOT SUBSCRIBED]" }}</h4>
+    <canvas id="temp"></canvas>
+    <div id="temp-val" class="current">—</div>
   </div>
-  <div>
-    <h4>Humidity (%)</h4>
-    <canvas id="chart-hum" height="160"></canvas>
+
+  <div class="card">
+    <h4>{{ "Humidity (%)" if hum_sub else "Humidity [NOT SUBSCRIBED]" }}</h4>
+    <canvas id="hum"></canvas>
+    <div id="hum-val" class="current">—</div>
   </div>
-  <div>
-    <h4>Pressure</h4>
-    <canvas id="chart-pres" height="160"></canvas>
+
+  <div class="card">
+    <h4>{{ "Pressure (hPa)" if pres_sub else "Pressure [NOT SUBSCRIBED]" }}</h4>
+    <canvas id="pres"></canvas>
+    <div id="pres-val" class="current">—</div>
   </div>
-  <div>
-    <h4>Raw live stream</h4>
+
+  <div class="card">
+    <h4>Raw Stream</h4>
     <div id="raw"></div>
   </div>
+
 </div>
 
 <script>
-const MAX_POINTS = 500;
-
-// create chart helper (time x-axis)
-function makeChart(ctx, label, color, unit){
-  return new Chart(ctx, {
-    type: 'line',
-    data: { datasets: [{ label: label, data: [], borderColor: color, backgroundColor: color, pointRadius: 0, fill: false }]},
-    options: {
-      animation: false,
-      parsing: false,
-      scales: {
-        x: {
-          type: 'time',
-          time: { tooltipFormat: 'HH:mm:ss', unit: 'second' }
-        },
-        y: {
-          ticks: { callback: v => (unit ? v + ' ' + unit : v) }
-        }
-      },
-      plugins: { legend: { display: false } },
-    }
-  });
-}
-
-const chartTemp = makeChart(document.getElementById('chart-temp').getContext('2d'), 'Temperature', 'rgb(220,50,50)', '°C');
-const chartHum  = makeChart(document.getElementById('chart-hum').getContext('2d'), 'Humidity', 'rgb(30,120,200)', '%');
-const chartPres = makeChart(document.getElementById('chart-pres').getContext('2d'), 'Pressure', 'rgb(40,180,90)', 'hPa');
-
-function pushPoint(chart, ts, value){
-  if(value === null || value === undefined) return;
-  chart.data.datasets[0].data.push({x: ts, y: value});
-  if(chart.data.datasets[0].data.length > MAX_POINTS) chart.data.datasets[0].data.shift();
-  chart.update('none');
-}
-
-// load initial history
-fetch('/api/history').then(r => r.json()).then(d => {
-  if(d.temp) for(const [ts,v] of d.temp) pushPoint(chartTemp, ts, v);
-  if(d.hum)  for(const [ts,v] of d.hum)  pushPoint(chartHum,  ts, v);
-  if(d.pres) for(const [ts,v] of d.pres) pushPoint(chartPres, ts, v);
+const tempChart = new Chart(document.getElementById("temp"), {
+    type:"line", data:{datasets:[{data:[], borderColor:"red"}]},
+    options:{animation:false, parsing:false,plugins: { legend: { display: false } },
+      scales:{x:{type:"time", time:{unit:"second"}}}}
+});
+const humChart = new Chart(document.getElementById("hum"), {
+    type:"line", data:{datasets:[{data:[], borderColor:"blue"}]},
+    options:{animation:false, parsing:false,parsing:false,plugins: { legend: { display: false } },
+      scales:{x:{type:"time", time:{unit:"second"}}}}
+});
+const presChart = new Chart(document.getElementById("pres"), {
+    type:"line", data:{datasets:[{data:[], borderColor:"green"}]},
+    options:{animation:false, parsing:false,parsing:false,plugins: { legend: { display: false } },
+      scales:{x:{type:"time", time:{unit:"second"}}}}
 });
 
-// SSE live stream
-const es = new EventSource('/stream');
-es.onmessage = (e) => {
-  const m = JSON.parse(e.data);
-  const ts = m.ts || Date.now();
-  pushPoint(chartTemp, ts, m.temp);
-  pushPoint(chartHum, ts, m.hum);
-  pushPoint(chartPres, ts, m.pres);
+function push(chart,ts,val){
+  if(val==null) return;
+  chart.data.datasets[0].data.push({x:ts,y:val});
+  if(chart.data.datasets[0].data.length>500)
+     chart.data.datasets[0].data.shift();
+  chart.update("none");
+}
 
-  // raw log
-  const raw = document.getElementById('raw');
-  const pre = document.createElement('pre');
-  pre.textContent = JSON.stringify(m.raw || m, null, 2);
-  raw.prepend(pre);
-  if(raw.children.length > 200) raw.removeChild(raw.lastChild);
-};
+fetch("/api/history").then(r=>r.json()).then(d=>{
+    {% if temp_sub %} d.temp.forEach(v=>push(tempChart,v[0],v[1])); {% endif %}
+    {% if hum_sub %}  d.hum.forEach(v=>push(humChart,v[0],v[1])); {% endif %}
+    {% if pres_sub %} d.pres.forEach(v=>push(presChart,v[0],v[1])); {% endif %}
+});
 
-es.onerror = (ev) => {
-  console.warn("SSE error", ev);
+const es = new EventSource("/stream");
+
+es.onmessage = e=>{
+    const m = JSON.parse(e.data);
+
+    {% if temp_sub %}
+    if(m.temp!=null) {
+        push(tempChart, m.ts, m.temp);
+        document.getElementById("temp-val").textContent = m.temp + " °C";
+    }
+    {% else %}
+    document.getElementById("temp-val").textContent = "Not subscribed";
+    {% endif %}
+
+    {% if hum_sub %}
+    if(m.hum!=null) {
+        push(humChart, m.ts, m.hum);
+        document.getElementById("hum-val").textContent = m.hum + " %";
+    }
+    {% else %}
+    document.getElementById("hum-val").textContent = "Not subscribed";
+    {% endif %}
+
+    {% if pres_sub %}
+    if(m.pres!=null) {
+        push(presChart, m.ts, m.pres);
+        document.getElementById("pres-val").textContent = m.pres;
+    }
+    {% else %}
+    document.getElementById("pres-val").textContent = "Not subscribed";
+    {% endif %}
+
+    const raw=document.getElementById("raw");
+    const pre=document.createElement("pre");
+    pre.textContent = JSON.stringify(m.raw,null,2);
+    raw.prepend(pre);
+    if(raw.children.length>200) raw.removeChild(raw.lastChild);
 };
 </script>
-</body>
-</html>
+
+</body></html>
 """
 
-# ---------- Routes ----------
+# -------------------------------------------------------------------
+# MAIN PAGE
+# -------------------------------------------------------------------
 @app.route("/")
 def index():
     if "user" not in session:
-        return redirect(url_for("login"))
-    return render_template_string(INDEX_HTML, broker=f"{BROKER_HOST}:{BROKER_PORT}", topic=MQTT_TOPIC, user=session["user"])
+        return redirect("/login")
 
-# ---------- Run server ----------
+    return render_template_string(
+        INDEX_HTML,
+        user=session["user"],
+        broker=f"{BROKER_HOST}:{BROKER_PORT}",
+        topic=MQTT_TOPIC,
+        temp_sub=session.get("temp_sub",0),
+        hum_sub=session.get("hum_sub",0),
+        pres_sub=session.get("pres_sub",0),
+    )
+
+# -------------------------------------------------------------------
+# RUN SERVER
+# -------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Starting Flask app...")
-    print("SQL_API:", SQL_API)
-    print("BROKER:", BROKER_HOST, BROKER_PORT)
+    print("WeatherPi started")
     app.run(host="0.0.0.0", port=5000, threaded=True)
