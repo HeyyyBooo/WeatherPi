@@ -2,21 +2,25 @@ import time
 import json
 import socket
 from paho.mqtt import client as mqtt
-import Adafruit_DHT
+import adafruit_dht
+import board
+
+dht_device = adafruit_dht.DHT11(board.D4)
+
 
 # -------------------------
 # Sensor setup
 # -------------------------
-DHT_SENSOR = Adafruit_DHT.DHT11
+DHT_SENSOR = adafruit_dht.DHT11
 DHT_PIN = 4  # GPIO4 (Pin 7)
 
 # -------------------------
 # MQTT setup
 # -------------------------
-BROKER_HOST = "10.147.255.200"
+BROKER_HOST = "172.30.148.200"
 BROKER_PORT = 1883
 DEVICE_ID = socket.gethostname()
-MYKEY = "VUSAN"
+MYKEY = "VUSANP"
 
 client = mqtt.Client(protocol=mqtt.MQTTv5)
 client.connect(BROKER_HOST, BROKER_PORT, keepalive=60)
@@ -32,27 +36,38 @@ client.publish(f"devices/{DEVICE_ID}/status", "online", qos=1, retain=True)
 def encrypt(num, key):
     number_str = str(num)
     key_str = str(key)
-    
+   
     encrypted = []
     for i, ch in enumerate(number_str):
         encrypted_val = ord(ch) ^ ord(key_str[i % len(key_str)])
         encrypted.append(str(encrypted_val))
-    
+   
     return "-".join(encrypted)
 
 
 
 def read_dht():
-    """Read DHT11 sensor"""
-    humidity, temperature = Adafruit_DHT.read_retry(DHT_SENSOR, DHT_PIN)
-    if humidity is not None and temperature is not None:
-        print(f"Temp = {temperature:.1f}°C | Humidity = {humidity:.1f}%")
-        return {"temperature": encrypt(temperature, MYKEY), "humidity": encrypt(humidity, MYKEY)}
-    else:
-        print("Failed to retrieve data from DHT sensor")
-        return None
-	
+    try:
+        temperature = dht_device.temperature
+        humidity = dht_device.humidity
 
+        if temperature is not None and humidity is not None:
+            print(f"ENCRYPTED : Temp = {encrypt(temperature, MYKEY)} | Humidity = {encrypt(humidity, MYKEY)}")
+            print(f"ORIGINAL  : Temp = {temperature}°C | Humidity = {humidity}%")
+            return {
+                "temperature": encrypt(temperature, MYKEY),
+                "humidity": encrypt(humidity, MYKEY)
+            }
+        else:
+            print("Sensor read failed")
+            return None
+
+    except RuntimeError as e:
+        print(f"DHT read error: {e}")
+        return None
+
+
+'''
 def send_to_mqtt(data):
     """Publish DHT data to MQTT"""
     payload = {
@@ -62,11 +77,11 @@ def send_to_mqtt(data):
         "device": DEVICE_ID
     }
     topic = f"sensors/{DEVICE_ID}/dht11"
-    client.publish(topic, json.dumps(payload), qos=1, retain=False)
-'''
+    client.publish(topic, json.dumps(payload), qos=1, retain=False) '''
+
 def send_to_mqtt(data):
     """Publish temperature and humidity to separate MQTT topics"""
-    
+   
     timestamp = int(time.time() * 1000)
 
     # Temperature topic
@@ -88,7 +103,7 @@ def send_to_mqtt(data):
     }
     hum_topic = f"sensors/{DEVICE_ID}/humidity"
     client.publish(hum_topic, json.dumps(hum_payload), qos=1, retain=False)
-'''
+
 # -------------------------
 # Main loop
 # -------------------------
